@@ -1,6 +1,6 @@
+# frozen_string_literal: true
 require 'sprockets/asset'
 require 'sprockets/digest_utils'
-require 'sprockets/engines'
 require 'sprockets/errors'
 require 'sprockets/file_reader'
 require 'sprockets/mime'
@@ -18,7 +18,7 @@ module Sprockets
   # object.
   module Loader
     include DigestUtils, PathUtils, ProcessorUtils, URIUtils
-    include Engines, Mime, Processing, Resolve, Transformers
+    include Mime, Processing, Resolve, Transformers
 
 
     # Public: Load Asset by Asset URI.
@@ -26,7 +26,6 @@ module Sprockets
     # uri - A String containing complete URI to a file including schema
     #       and full path such as:
     #       "file:///Path/app/assets/js/app.js?type=application/javascript"
-    #
     #
     # Returns Asset.
     def load(uri)
@@ -46,7 +45,7 @@ module Sprockets
           # The presence of `paths` indicates dependencies were stored.
           # We can check to see if the dependencies have not changed by "resolving" them and
           # generating a digest key from the resolved entries. If this digest key has not
-          # changed the asset will be pulled from cache.
+          # changed, the asset will be pulled from cache.
           #
           # If this `paths` is present but the cache returns nothing then `fetch_asset_from_dependency_cache`
           # will confusingly be called again with `paths` set to nil where the asset will be
@@ -61,7 +60,7 @@ module Sprockets
           end
         end
       end
-      Asset.new(self, asset)
+      Asset.new(asset)
     end
 
     private
@@ -78,15 +77,15 @@ module Sprockets
           asset[:uri]       = expand_from_root(asset[:uri])
           asset[:load_path] = expand_from_root(asset[:load_path])
           asset[:filename]  = expand_from_root(asset[:filename])
-          asset[:metadata][:included].map!          { |uri| expand_from_root(uri) } if asset[:metadata][:included]
-          asset[:metadata][:links].map!             { |uri| expand_from_root(uri) } if asset[:metadata][:links]
-          asset[:metadata][:stubbed].map!           { |uri| expand_from_root(uri) } if asset[:metadata][:stubbed]
-          asset[:metadata][:required].map!          { |uri| expand_from_root(uri) } if asset[:metadata][:required]
-          asset[:metadata][:dependencies].map!      { |uri| uri.start_with?("file-digest://") ? expand_from_root(uri) : uri } if asset[:metadata][:dependencies]
+          asset[:metadata][:included]     = asset[:metadata][:included].map     { |uri| expand_from_root(uri) }.to_set if asset[:metadata][:included]
+          asset[:metadata][:links]        = asset[:metadata][:links].map        { |uri| expand_from_root(uri) }.to_set if asset[:metadata][:links]
+          asset[:metadata][:stubbed]      = asset[:metadata][:stubbed].map      { |uri| expand_from_root(uri) }.to_set if asset[:metadata][:stubbed]
+          asset[:metadata][:required]     = asset[:metadata][:required].map     { |uri| expand_from_root(uri) }.to_set if asset[:metadata][:required]
+          asset[:metadata][:dependencies] = asset[:metadata][:dependencies].map { |uri| uri.start_with?("file-digest://") ? expand_from_root(uri) : uri }.to_set  if asset[:metadata][:dependencies]
 
           asset[:metadata].each_key do |k|
             next unless k =~ /_dependencies\z/
-            asset[:metadata][k].map! { |uri| expand_from_root(uri) }
+            asset[:metadata][k] = asset[:metadata][k].map { |uri| expand_from_root(uri) }.to_set
           end
         end
         asset
@@ -103,13 +102,23 @@ module Sprockets
           raise FileNotFound, "could not find file: #{unloaded.filename}"
         end
 
-        load_path, logical_path = paths_split(config[:paths], unloaded.filename)
+        path_to_split =
+          if index_alias = unloaded.params[:index_alias]
+            expand_from_root index_alias
+          else
+            unloaded.filename
+          end
+
+        load_path, logical_path = paths_split(config[:paths], path_to_split)
 
         unless load_path
-          raise FileOutsidePaths, "#{unloaded.filename} is no longer under a load path: #{self.paths.join(', ')}"
+          target = path_to_split
+          target += " (index alias of #{unloaded.filename})" if unloaded.params[:index_alias]
+          raise FileOutsidePaths, "#{target} is no longer under a load path: #{self.paths.join(', ')}"
         end
 
-        logical_path, file_type, engine_extnames, _ = parse_path_extnames(logical_path)
+        extname, file_type = match_path_extname(logical_path, mime_exts)
+        logical_path = logical_path.chomp(extname)
         name = logical_path
 
         if pipeline = unloaded.params[:pipeline]
@@ -124,13 +133,14 @@ module Sprockets
           raise ConversionError, "could not convert #{file_type.inspect} to #{type.inspect}"
         end
 
-        processors = processors_for(type, file_type, engine_extnames, pipeline)
+        processors = processors_for(type, file_type, pipeline)
 
-        processors_dep_uri = build_processors_uri(type, file_type, engine_extnames, pipeline)
+        processors_dep_uri = build_processors_uri(type, file_type, pipeline)
         dependencies = config[:dependencies] + [processors_dep_uri]
 
         # Read into memory and process if theres a processor pipeline
         if processors.any?
+
           result = call_processors(processors, {
             environment: self,
             cache: self.cache,
@@ -139,13 +149,15 @@ module Sprockets
             load_path: load_path,
             name: name,
             content_type: type,
-            metadata: { dependencies: dependencies }
+            metadata: {
+              dependencies: dependencies
+            }
           })
           validate_processor_result!(result)
           source = result.delete(:data)
           metadata = result
           metadata[:charset] = source.encoding.name.downcase unless metadata.key?(:charset)
-          metadata[:digest]  = digest(source)
+          metadata[:digest]  = digest(self.version + source)
           metadata[:length]  = source.bytesize
         else
           dependencies << build_file_digest_uri(unloaded.filename)
@@ -168,19 +180,8 @@ module Sprockets
           dependencies_digest: DigestUtils.digest(resolve_dependencies(metadata[:dependencies]))
         }
 
-        asset[:id]  = pack_hexdigest(digest(asset))
+        asset[:id]  = hexdigest(asset)
         asset[:uri] = build_asset_uri(unloaded.filename, unloaded.params.merge(id: asset[:id]))
-
-        # Deprecated: Avoid tracking Asset mtime
-        asset[:mtime] = metadata[:dependencies].map { |u|
-          if u.start_with?("file-digest:")
-            s = self.stat(parse_file_digest_uri(u))
-            s ? s.mtime.to_i : nil
-          else
-            nil
-          end
-        }.compact.max
-        asset[:mtime] ||= self.stat(unloaded.filename).mtime.to_i
 
         store_asset(asset, unloaded)
         asset
@@ -201,40 +202,34 @@ module Sprockets
         cached_asset[:load_path] = compress_from_root(asset[:load_path])
 
         if cached_asset[:metadata]
-          # Deep dup to avoid modifying `asset`
+          # Dup to avoid modifying `asset`
           cached_asset[:metadata] = cached_asset[:metadata].dup
           if cached_asset[:metadata][:included] && !cached_asset[:metadata][:included].empty?
-            cached_asset[:metadata][:included] = cached_asset[:metadata][:included].dup
-            cached_asset[:metadata][:included].map! { |uri| compress_from_root(uri) }
+            cached_asset[:metadata][:included] = cached_asset[:metadata][:included].map { |uri| compress_from_root(uri) }.to_set
           end
 
           if cached_asset[:metadata][:links] && !cached_asset[:metadata][:links].empty?
-            cached_asset[:metadata][:links] = cached_asset[:metadata][:links].dup
-            cached_asset[:metadata][:links].map! { |uri| compress_from_root(uri) }
+            cached_asset[:metadata][:links] = cached_asset[:metadata][:links].map { |uri| compress_from_root(uri) }.to_set
           end
 
           if cached_asset[:metadata][:stubbed] && !cached_asset[:metadata][:stubbed].empty?
-            cached_asset[:metadata][:stubbed] = cached_asset[:metadata][:stubbed].dup
-            cached_asset[:metadata][:stubbed].map! { |uri| compress_from_root(uri) }
+            cached_asset[:metadata][:stubbed] = cached_asset[:metadata][:stubbed].map { |uri| compress_from_root(uri) }.to_set
           end
 
           if cached_asset[:metadata][:required] && !cached_asset[:metadata][:required].empty?
-            cached_asset[:metadata][:required] = cached_asset[:metadata][:required].dup
-            cached_asset[:metadata][:required].map! { |uri| compress_from_root(uri) }
+            cached_asset[:metadata][:required] = cached_asset[:metadata][:required].map { |uri| compress_from_root(uri) }.to_set
           end
 
           if cached_asset[:metadata][:dependencies] && !cached_asset[:metadata][:dependencies].empty?
-            cached_asset[:metadata][:dependencies] = cached_asset[:metadata][:dependencies].dup
-            cached_asset[:metadata][:dependencies].map! do |uri|
+            cached_asset[:metadata][:dependencies] = cached_asset[:metadata][:dependencies].map do |uri|
               uri.start_with?("file-digest://".freeze) ? compress_from_root(uri) : uri
-            end
+            end.to_set
           end
 
-          # compress all _dependencies in metadata like `sass_dependencies`
+          # Compress all _dependencies in metadata like `sass_dependencies`
           cached_asset[:metadata].each do |key, value|
             next unless key =~ /_dependencies\z/
-            cached_asset[:metadata][key] = value.dup
-            cached_asset[:metadata][key].map! {|uri| compress_from_root(uri) }
+            cached_asset[:metadata][key] = cached_asset[:metadata][key].map {|uri| compress_from_root(uri) }.to_set
           end
         end
 
@@ -255,11 +250,11 @@ module Sprockets
       #           "processors:type=text/css&file_type=text/css&pipeline=self",
       #           "file-digest:///Full/path/app/assets/stylesheets"]
       #
-      # Returns back array of things that the given uri dpends on
+      # Returns back array of things that the given uri depends on
       # For example the environment version, if you're using a different version of sprockets
       # then the dependencies should be different, this is used only for generating cache key
       # for example the "environment-version" may be resolved to "environment-1.0-3.2.0" for
-      #  version "3.2.0" of sprockets.
+      # version "3.2.0" of sprockets.
       #
       # Any paths that are returned are converted to relative paths
       #
@@ -276,9 +271,9 @@ module Sprockets
       #
       # This method attempts to retrieve the last `limit` number of histories of an asset
       # from the cache a "history" which is an array of unresolved "dependencies" that the asset needs
-      # to compile. In this case A dependency can refer to either an asset i.e. index.js
-      # may rely on jquery.js (so jquery.js is a depndency), or other factors that may affect
-      # compilation, such as the VERSION of sprockets (i.e. the environment) and what "processors"
+      # to compile. In this case a dependency can refer to either an asset e.g. index.js
+      # may rely on jquery.js (so jquery.js is a dependency), or other factors that may affect
+      # compilation, such as the VERSION of Sprockets (i.e. the environment) and what "processors"
       # are used.
       #
       # For example a history array may look something like this
@@ -289,7 +284,7 @@ module Sprockets
       #     "file-digest:///Full/path/app/assets/stylesheets"]]
       #
       # Where the first entry is a Set of dependencies for last generated version of that asset.
-      # Multiple versions are stored since sprockets keeps the last `limit` number of assets
+      # Multiple versions are stored since Sprockets keeps the last `limit` number of assets
       # generated present in the system.
       #
       # If a "history" of dependencies is present in the cache, each version of "history" will be
@@ -315,9 +310,10 @@ module Sprockets
         end
 
         asset = yield
-        deps  = asset[:metadata][:dependencies].dup.map! do |uri|
+        deps  = asset[:metadata][:dependencies].map   do |uri|
           uri.start_with?("file-digest://") ? compress_from_root(uri) : uri
-        end
+        end.to_set
+
         cache.set(key, history.unshift(deps).take(limit))
         asset
       end
